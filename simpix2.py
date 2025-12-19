@@ -33,16 +33,21 @@ def total_cost(src_flat: np.ndarray, tgt_flat: np.ndarray, perm: np.ndarray) -> 
 
 if NUMBA_AVAILABLE:
     @njit
-    def pixel_cost_nb(src_flat: np.ndarray, tgt_flat: np.ndarray, si: int, ti: int) -> int:
-        dr = int(src_flat[si, 0]) - int(tgt_flat[ti, 0])
-        dg = int(src_flat[si, 1]) - int(tgt_flat[ti, 1])
-        db = int(src_flat[si, 2]) - int(tgt_flat[ti, 2])
-        return dr * dr + dg * dg + db * db
+    def pixel_cost_nb(src_i16: np.ndarray, tgt_i16: np.ndarray, si: int, ti: int) -> int:
+        """
+        Cost between source pixel index si and target pixel index ti.
+        Inputs are int16 arrays to avoid uint8 wraparound.
+        Squares in int32 to avoid overflow.
+        """
+        dr = np.int32(src_i16[si, 0]) - np.int32(tgt_i16[ti, 0])
+        dg = np.int32(src_i16[si, 1]) - np.int32(tgt_i16[ti, 1])
+        db = np.int32(src_i16[si, 2]) - np.int32(tgt_i16[ti, 2])
+        return int(dr * dr + dg * dg + db * db)
 
     @njit
     def anneal_nb(
-        src_flat: np.ndarray,
-        tgt_flat: np.ndarray,
+        src_i16: np.ndarray,
+        tgt_i16: np.ndarray,
         steps_per_T: int,
         T0: float,
         alpha: float,
@@ -52,10 +57,11 @@ if NUMBA_AVAILABLE:
         """
         Numba-accelerated simulated annealing.
         Returns (best_perm, best_cost, n_temp_steps, last_accept_ratio).
-        """
-        n = src_flat.shape[0]
 
-        # Numba supports seeding + np.random.* inside njit
+        NOTE: Uses np.random.* supported by numba (no RandomState object).
+        """
+        n = src_i16.shape[0]
+
         np.random.seed(seed_int)
 
         # initial perm (Fisher-Yates shuffle)
@@ -67,9 +73,9 @@ if NUMBA_AVAILABLE:
             perm[j] = tmp
 
         # initial cost (int64 accumulator)
-        cost = 0
+        cost = np.int64(0)
         for i in range(n):
-            cost += pixel_cost_nb(src_flat, tgt_flat, perm[i], i)
+            cost += pixel_cost_nb(src_i16, tgt_i16, perm[i], i)
 
         best_cost = cost
         best_perm = perm.copy()
@@ -80,21 +86,23 @@ if NUMBA_AVAILABLE:
 
         while T > Tmin:
             accepted = 0
+            attempted = 0
 
             for _ in range(steps_per_T):
                 i = np.random.randint(0, n)
                 j = np.random.randint(0, n)
                 if i == j:
                     continue
+                attempted += 1
 
                 pi = perm[i]
                 pj = perm[j]
 
-                c_i_old = pixel_cost_nb(src_flat, tgt_flat, pi, i)
-                c_j_old = pixel_cost_nb(src_flat, tgt_flat, pj, j)
+                c_i_old = pixel_cost_nb(src_i16, tgt_i16, pi, i)
+                c_j_old = pixel_cost_nb(src_i16, tgt_i16, pj, j)
 
-                c_i_new = pixel_cost_nb(src_flat, tgt_flat, pj, i)
-                c_j_new = pixel_cost_nb(src_flat, tgt_flat, pi, j)
+                c_i_new = pixel_cost_nb(src_i16, tgt_i16, pj, i)
+                c_j_new = pixel_cost_nb(src_i16, tgt_i16, pi, j)
 
                 dE = (c_i_new + c_j_new) - (c_i_old + c_j_old)
 
@@ -104,6 +112,7 @@ if NUMBA_AVAILABLE:
                     cost += dE
                     accepted += 1
                 else:
+                    # Metropolis criterion
                     if np.random.random() < math.exp(-dE / T):
                         perm[i] = pj
                         perm[j] = pi
@@ -115,7 +124,11 @@ if NUMBA_AVAILABLE:
                     best_perm = perm.copy()
 
             n_temp += 1
-            last_acc_ratio = accepted / float(steps_per_T)
+            if attempted > 0:
+                last_acc_ratio = accepted / float(attempted)
+            else:
+                last_acc_ratio = 0.0
+
             T *= alpha
 
         return best_perm, float(best_cost), n_temp, last_acc_ratio
@@ -148,6 +161,10 @@ def simulated_annealing(
     n = src_flat.shape[0]
 
     if NUMBA_AVAILABLE:
+        # Convert ONCE to signed type to avoid uint8 wraparound inside numba
+        src_i16 = src_flat.astype(np.int16)
+        tgt_i16 = tgt_flat.astype(np.int16)
+
         if verbose:
             print("Numba: enabled (fast path).")
             print(f"Seed used: {seed_used}")
@@ -157,7 +174,7 @@ def simulated_annealing(
             )
 
         best_perm, best_cost, n_temp, last_acc = anneal_nb(
-            src_flat, tgt_flat, steps_per_T, T0, alpha, Tmin, seed_used
+            src_i16, tgt_i16, steps_per_T, T0, alpha, Tmin, seed_used
         )
 
         if verbose:
@@ -193,11 +210,14 @@ def simulated_annealing(
     it = 0
     while T > Tmin:
         accepted = 0
+        attempted = 0
+
         for _ in range(steps_per_T):
             i = rng.randrange(n)
             j = rng.randrange(n)
             if i == j:
                 continue
+            attempted += 1
 
             pi = perm[i]
             pj = perm[j]
@@ -235,7 +255,7 @@ def simulated_annealing(
 
         it += 1
         if verbose:
-            acc_ratio = accepted / float(steps_per_T)
+            acc_ratio = accepted / float(attempted) if attempted > 0 else 0.0
             print(
                 f"Iter {it:3d}: T={T:8.3f}, cost={cost:.3e}, "
                 f"best={best_cost:.3e}, accepted={acc_ratio:.3f}"
@@ -373,4 +393,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
